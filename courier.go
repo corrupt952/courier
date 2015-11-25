@@ -8,6 +8,7 @@ import(
 	"net/http"
 	"strings"
 	"regexp"
+	"runtime"
 
 	"github.com/fsouza/go-dockerclient"
 	"github.com/joho/godotenv"
@@ -27,20 +28,32 @@ var ignoredHeaderNames = []string{
 type Proxy struct {
 	RequestConverter func(r, proxyRequest *http.Request)
 	Transport http.RoundTripper
+	DockerHost string
+	DockerClient *docker.Client
 }
 
-func NewProxyWithHostConverter(hostConverter func(string) string) *Proxy {
-	return &Proxy{
-		RequestConverter: func(r, proxyRequest *http.Request) {
-			proxyRequest.URL.Host = hostConverter(r.Host)
-		},
-		Transport: http.DefaultTransport,
+func (proxy *Proxy) resolveContainer(r *http.Request) (string) {
+	re := regexp.MustCompile(`^([a-zA-Z0-9-]+)\.([0-9]+)\.`)
+	group := re.FindSubmatch([]byte(r.Host))
+	if len(group) < 3 {
+		log.Printf("Can't match. %s", r.Host)
 	}
+
+	name := string(group[1])
+	container, err := proxy.DockerClient.InspectContainer(name)
+	if err != nil {
+		log.Printf("Container not found. %s", name)
+		return ""
+	}
+
+	containerPort := container.NetworkSettings.Ports[docker.Port(group[2]) + "/tcp"][0].HostPort
+	return proxy.DockerHost + ":" + containerPort
 }
 
 func (proxy *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	proxyRequest := proxy.copyRequest(r)
-	proxy.RequestConverter(r, proxyRequest)
+	log.Printf("Host: %s", r.Host)
+	proxyRequest.URL.Host = proxy.resolveContainer(r)
 
 	res, err := proxy.Transport.RoundTrip(proxyRequest)
 	if err != nil {
@@ -91,33 +104,24 @@ func (proxy *Proxy) copyRequest(r *http.Request) *http.Request {
 
 func main() {
 	if godotenv.Load() != nil {
-		log.Fatal("Error loading .env file")
+		log.Fatal("Can't load .env file")
 	}
 
 	client, err := docker.NewClientFromEnv()
 	if err != nil {
 		log.Fatal("Err: %v", err)
 	}
+
 	dockerHost := os.Getenv("COURIER_DOCKER_HOST")
 	if dockerHost == "" {
 		dockerHost = "localhost"
 	}
-	re := regexp.MustCompile(`^([a-zA-Z0-9]+)\.([0-9]+)\.`)
 
-	converter := func(originalHost string) string {
-		group := re.FindSubmatch([]byte(originalHost))
-		name := string(group[1])
-		container, err := client.InspectContainer(name)
-		if err != nil {
-			log.Printf("Container not found. %s", name)
-		}
-		log.Printf("Host: %v", originalHost)
-		_port := docker.Port(group[2]) + "/tcp"
-		containerPort := container.NetworkSettings.Ports[_port][0].HostPort
-		return dockerHost + ":" + containerPort
+	proxy := &Proxy{
+		Transport: http.DefaultTransport,
+		DockerHost: dockerHost,
+		DockerClient: client,
 	}
-
-	proxy := NewProxyWithHostConverter(converter)
 
 	port := os.Getenv("COURIER_PORT")
 	if port == "" {
@@ -125,5 +129,6 @@ func main() {
 	}
 
 	log.Printf("Listen %s", port)
+	runtime.GOMAXPROCS(runtime.NumCPU())
 	http.ListenAndServe(":" + port, proxy)
 }
