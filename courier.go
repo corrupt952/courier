@@ -1,126 +1,113 @@
 package main
 
-import(
-	"os"
-	"io"
+import (
+	"context"
+	"bytes"
+	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
-	"strings"
+	"net/http/httputil"
+	"os"
 	"regexp"
 	"runtime"
+	"strings"
+	"errors"
+	"fmt"
 
-	"github.com/fsouza/go-dockerclient"
-	"github.com/joho/godotenv"
+	"github.com/docker/docker/client"
 )
 
-var ignoredHeaderNames = []string{
-	"Connection",
-	"Keep-Alive",
-	"Proxy-Authenticate",
-	"Proxy-Authorization",
-	"Te",
-	"Trailers",
-	"Transfer-Encoding",
-	"Upgrade",
-}
+const (
+	FORWARDED_FOR_HEADER_NAME = "X-Forwarded-For"
+	FORWARDED_HOST_HEADER_NAME = "X-Forwarded-Host"
+)
 
 type Proxy struct {
-	RequestConverter func(r, proxyRequest *http.Request)
-	Transport http.RoundTripper
-	DockerHost string
-	DockerClient *docker.Client
+	ProxyHost   string
+	DockerClient *client.Client
 }
 
-func (proxy *Proxy) resolveContainer(r *http.Request) (string) {
-	re := regexp.MustCompile(`^([a-zA-Z0-9-]+)\.([0-9]+)\.`)
-	group := re.FindSubmatch([]byte(r.Host))
-	if len(group) < 3 {
-		log.Printf("Can't match. %s", r.Host)
+func (proxy *Proxy) resolveContainer(request *http.Request) (string, error) {
+	re := regexp.MustCompile(`^([a-zA-Z0-9-]+)\.`)
+	group := re.FindSubmatch([]byte(request.Host))
+	if len(group) < 2 {
+		return "", errors.New(fmt.Sprintf("Can't match regexp: %s", request.Host))
 	}
 
 	name := string(group[1])
-	container, err := proxy.DockerClient.InspectContainer(name)
+	container, err := proxy.DockerClient.ContainerInspect(context.Background(), name)
 	if err != nil {
-		log.Printf("Container not found. %s", name)
-		return ""
+		return "", errors.New(fmt.Sprintf("Container not found. %s", name))
+	}
+	// get first ports
+	var containerPort string
+	for _, port := range container.NetworkSettings.Ports {
+		if 1 <= len(port) {
+			containerPort = port[0].HostPort
+			break
+		}
+	}
+	if &containerPort == nil {
+		return "", errors.New(fmt.Sprintf("Container has't port mappings. %s", name))
 	}
 
-	containerPort := container.NetworkSettings.Ports[docker.Port(group[2]) + "/tcp"][0].HostPort
-	return proxy.DockerHost + ":" + containerPort
+	// port, err := nat.NewPort("tcp", string(group[2]))
+	// if err != nil {
+	// 	log.Printf("Container not found. %s", name)
+	// 	// TODO: error handling
+	// 	return ""
+	// }
+	// containerPort := container.NetworkSettings.Ports[port][0].HostPort
+
+	return proxy.ProxyHost + ":" + containerPort, nil
 }
 
-func (proxy *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	proxyRequest := proxy.copyRequest(r)
-	log.Printf("Host: %s", r.Host)
-	proxyRequest.URL.Host = proxy.resolveContainer(r)
+func (proxy *Proxy) director(request *http.Request) {
+	url := *request.URL
+	url.Scheme = "http"
 
-	res, err := proxy.Transport.RoundTrip(proxyRequest)
+	host, err := proxy.resolveContainer(request)
 	if err != nil {
-		log.Printf("Unknown host %s", r.Host)
-		w.WriteHeader(http.StatusInternalServerError)
+		// TODO: error handling
+		log.Println(err.Error())
 		return
 	}
+	url.Host = host
 
-	defer res.Body.Close()
-	for key, values := range res.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
+	var buffer []byte
+	if request.Body != nil {
+		buffer, err = ioutil.ReadAll(request.Body)
+		if err != nil {
+			log.Fatal(err.Error())
 		}
 	}
-
-	w.WriteHeader(res.StatusCode)
-	io.Copy(w, res.Body)
-}
-
-func (proxy *Proxy) copyRequest(r *http.Request) *http.Request {
-	proxyRequest := new(http.Request)
-	*proxyRequest = *r
-	proxyRequest.Proto = "HTTP/1.1"
-	proxyRequest.ProtoMajor = 1
-	proxyRequest.ProtoMinor = 1
-	proxyRequest.Close = false
-	proxyRequest.Header = make(http.Header)
-	proxyRequest.URL.Scheme = "http"
-	proxyRequest.URL.Path = r.URL.Path
-
-	for key, values := range r.Header {
-		for _, value := range values {
-			proxyRequest.Header.Add(key, value)
-		}
+	proxyRequest, err := http.NewRequest(request.Method, url.String(), bytes.NewBuffer(buffer))
+	if err != nil {
+		log.Fatal(err.Error())
 	}
-	for _, headerName := range ignoredHeaderNames {
-		proxyRequest.Header.Del(headerName)
-	}
-	if requestHost, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		if values, ok := proxyRequest.Header["X-Forwarded-For"]; ok {
+	proxyRequest.Header = request.Header
+
+	if requestHost, _, err := net.SplitHostPort(request.RemoteAddr); err == nil {
+		if values, ok := proxyRequest.Header[FORWARDED_FOR_HEADER_NAME]; ok {
 			requestHost = strings.Join(values, ", ") + ", " + requestHost
 		}
-		proxyRequest.Header.Set("X-Forwarded-For", requestHost)
+		proxyRequest.Header.Set(FORWARDED_FOR_HEADER_NAME, requestHost)
 	}
+	proxyRequest.Header.Set(FORWARDED_HOST_HEADER_NAME, request.Host)
 
-	return proxyRequest
+	*request = *proxyRequest
 }
 
 func main() {
-	if godotenv.Load() != nil {
-		log.Fatal("Can't load .env file")
-	}
-
-	client, err := docker.NewClientFromEnv()
+	dockerClient, err := client.NewEnvClient()
 	if err != nil {
 		log.Fatal("Err: %v", err)
 	}
 
-	dockerHost := os.Getenv("COURIER_DOCKER_HOST")
-	if dockerHost == "" {
-		dockerHost = "localhost"
-	}
-
-	proxy := &Proxy{
-		Transport: http.DefaultTransport,
-		DockerHost: dockerHost,
-		DockerClient: client,
+	ProxyHost := os.Getenv("COURIER_PROXY_HOST")
+	if ProxyHost == "" {
+		ProxyHost = "localhost"
 	}
 
 	port := os.Getenv("COURIER_PORT")
@@ -130,5 +117,11 @@ func main() {
 
 	log.Printf("Listen %s", port)
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	http.ListenAndServe(":" + port, proxy)
+
+	proxy := &Proxy{ProxyHost:ProxyHost,DockerClient: dockerClient,}
+	reverseProxy := &httputil.ReverseProxy{Director: proxy.director,}
+	server := http.Server{Addr: ":" + port, Handler: reverseProxy,}
+	if err := server.ListenAndServe(); err != nil {
+		log.Fatal(err.Error())
+	}
 }
